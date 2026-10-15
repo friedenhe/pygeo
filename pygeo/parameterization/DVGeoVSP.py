@@ -1,6 +1,7 @@
 # Standard Python modules
 from collections import OrderedDict
 import time
+from types import SimpleNamespace
 
 # External modules
 from baseclasses.utils import Error
@@ -63,13 +64,21 @@ class DVGeometryVSP(DVGeoSketch):
        A list of string defining the subset of the VSP components to use when
        exporting the P3D surface files
 
-    blendDist : dict, optional
-       Intersecting components to blend and their blending distance (mesh
-       units). Maps a host component name to its attached components and
-       their distances, e.g. ``{"Fuselage": {"Wing": 1.0, "Tail": 0.5}}``.
-       Points within this distance of an intersection curve follow the
-       motion of that curve with a smooth falloff, so moving one component
-       does not tear its junction. The blending is not included in the Jacobian.
+    blendComps : list of strings, optional
+       The names of the moving components whose junctions are blended, e.g.
+       ``["Wing", "Tail"]``. The intersection curves of each moving component
+       with all other overlapping components in comps are found automatically
+       and trimmed to the parts outside all other components. Points within
+       the blending distance of a curve follow its motion in the surface
+       coordinates of their own component with a smooth falloff, so moving a
+       component does not tear its junctions. See :class:`JunctionBlending`.
+       The blending is not included in the Jacobian.
+
+    blendScale : float, optional
+       The blending distance of each curve as a fraction of its size, i.e.,
+       the largest distance between two points of the curve, e.g., the root
+       chord for a wing. A larger scale spreads the motion of a junction over
+       a larger region, which allows larger motions before the mesh folds.
 
     Examples
     --------
@@ -81,11 +90,7 @@ class DVGeometryVSP(DVGeoSketch):
 
     """
 
-    def __init__(self, fileName, comm=MPI.COMM_WORLD, scale=1.0, comps=[], projTol=0.01, name=None, blendDist=None):
-        self.blendDist = blendDist
-        # baseline and current intersection curves, traced on the first addPointSet
-        self.curves0 = None
-        self.curves = None
+    def __init__(self, fileName, comm=MPI.COMM_WORLD, scale=1.0, comps=[], projTol=0.01, name=None, blendComps=None, blendScale=0.3):
         vspOutOfDate = False
         if vspInstalled:
             vspVersionStr = openvsp.GetVSPVersion()
@@ -167,6 +172,13 @@ class DVGeometryVSP(DVGeoSketch):
 
         self.useComposite = False
 
+        # blend the junctions of the moving components
+        self.blending = None
+        if blendComps:
+            self.blending = JunctionBlending(
+                self.vspModel, self.allComps, self.compNames, self.bbox, blendComps, blendScale, self.modelScale, self.projTol, comm
+            )
+
         if comm.rank == 0:
             t3 = time.time()
             print("Initialized DVGeometry VSP in", (t3 - t0), "seconds.")
@@ -245,8 +257,6 @@ class DVGeometryVSP(DVGeoSketch):
         r = np.zeros(npoints)
         s = np.zeros(npoints)
         t = np.zeros(npoints)
-        # surface (u, w) guess of each point from the quad mesh, used to start the blending projections
-        uwGuess = np.zeros((npoints, 2))
 
         # initialize one 3dvec for projections
         pnt = openvsp.vec3d()
@@ -282,7 +292,6 @@ class DVGeometryVSP(DVGeoSketch):
             # compute the initial guess using the  tesselation data of the surface
             ug = uv[i, 0] * du + self.uv[gind][0][ii]
             vg = uv[i, 1] * dv + self.uv[gind][1][jj]
-            uwGuess[i] = ug, vg
 
             # We now convert the surface parameteric variables (u,v) to their equivalent volume parameterization (r,s,t)
             # this will serve as our initial guess for the volume projection procedure
@@ -356,47 +365,8 @@ class DVGeometryVSP(DVGeoSketch):
 
         # Create the little class with the data
         self.pointSets[ptName] = PointSet(points, pts, geom, r, s, t)
-
-        # Pair the points of each intersecting component with the nearest node of their intersection curve.
-        if self.blendDist:
-            # External modules
-            from scipy.spatial import cKDTree
-
-            if self.curves0 is None:
-                self.curves0 = self._traceCurves()
-                self.curves = self.curves0
-
-            ps = self.pointSets[ptName]
-            ps.blend = []
-            for i, c in enumerate(self.curves0):
-                for g in (c["host"], c["att"]):
-                    idx = np.where(geom == g)[0]
-                    d, k = cKDTree(c["X"]).query(points[idx])
-                    w = np.clip(1.0 - d / c["dist"], 0.0, 1.0) ** 2
-                    keep = w > 0.0
-                    ps.blend.append((i, g == c["host"], idx[keep], k[keep], w[keep]))
-
-            # Find the surface (u, w) and offset of each blended point on its own component, so that
-            # the blended points can be projected back onto their component in update.
-            # The projection starts from the quad-mesh guess; the few points it misses are projected globally.
-            t3 = time.time()
-            ps.proj = []
-            allIdx = np.unique(np.concatenate([b[2] for b in ps.blend]))
-            nGlobal = 0
-            for g in np.unique(geom[allIdx]):
-                idx = allIdx[geom[allIdx] == g]
-                comp = self.allComps[g]
-                pts = self._toVec3d(points[idx])
-                u, w, d = self.vspModel.ProjVecPnt01Guess(comp, 0, pts, uwGuess[idx, 0].tolist(), uwGuess[idx, 1].tolist())
-                u, w = np.array(u), np.array(w)
-                bad = np.array(d) * self.modelScale > self.projTol
-                if bad.any():
-                    ub, wb, _ = self.vspModel.ProjVecPnt01(comp, 0, [pts[j] for j in np.where(bad)[0]])
-                    u[bad], w[bad] = ub, wb
-                    nGlobal += bad.sum()
-                ps.proj.append((comp, idx, u, w, points[idx] - self._evalSurf(comp, u, w)))
-            if self.comm.rank == 0:
-                print(f"DVGeoVSP: projected {len(allIdx)} blended points ({nGlobal} global) in {time.time() - t3:.3f} s")
+        if self.blending:
+            self.blending.addPointSet(ptName, points, geom)
 
         # Set the updated flag to false because the jacobian is not up to date.
         self.updated[ptName] = False
@@ -425,10 +395,8 @@ class DVGeometryVSP(DVGeoSketch):
 
         # we just need to set the design variables in the VSP model and we are done
         self._updateModel()
-
-        # trace the intersection curves of the new design
-        if self.curves0 is not None:
-            self.curves = self._traceCurves(self.curves0)
+        if self.blending:
+            self.blending.setDesign()
 
         # update the projected coordinates
         self._updateProjectedPts()
@@ -459,26 +427,8 @@ class DVGeometryVSP(DVGeoSketch):
 
         # new cfd point coordinates are the updated projections minus the offset
         newPts = self.pointSets[ptSetName].pts - self.pointSets[ptSetName].offset
-
-        # Move the points near each junction with its intersection curve. The correction is the
-        # motion of the curve minus the motion the point's own component gives at the curve node.
-        if self.blendDist:
-            for i, isHost, idx, k, w in self.pointSets[ptSetName].blend:
-                c0, c = self.curves0[i], self.curves[i]
-                own = c["Xh"] - c0["Xh"] if isHost else c["Xa"] - c0["Xa"]
-                newPts[idx] += w[:, None] * (c["X"] - c0["X"] - own)[k]
-
-            # Project the blended points back onto their own component, keeping their baseline offset,
-            # so that the blending slides the points along the surface without changing its shape.
-            t1 = time.time()
-            nProj = 0
-            for comp, idx, u0, w0, off in self.pointSets[ptSetName].proj:
-                pts = self._toVec3d(newPts[idx] - off)
-                u, w, _ = self.vspModel.ProjVecPnt01Guess(comp, 0, pts, u0.tolist(), w0.tolist())
-                newPts[idx] = self._evalSurf(comp, np.array(u), np.array(w)) + off
-                nProj += len(idx)
-            if self.comm.rank == 0:
-                print(f"DVGeoVSP: projected {nProj} blended points back (rank 0) in {time.time() - t1:.3f} s")
+        if self.blending:
+            newPts = self.blending.update(ptSetName, newPts)
 
         # Finally flag this pointSet as being up to date:
         self.updated[ptSetName] = True
@@ -884,120 +834,6 @@ class DVGeometryVSP(DVGeoSketch):
         # update the model
         self.vspModel.Update()
 
-    def _traceCurves(self, curves0=None):
-        """
-        Trace the intersection curve of each pair in blendDist on the root proc and
-        broadcast it. Without curves0, this traces the baseline curves. With curves0,
-        the same stations are traced on the current design.
-        """
-        curves = []
-        if self.comm.rank == 0:
-            i = 0
-            for hostName, atts in self.blendDist.items():
-                for attName, dist in atts.items():
-                    h = self.compNames.index(hostName)
-                    a = self.compNames.index(attName)
-                    t1 = time.time()
-                    curves.append(self._traceCurve(h, a, None if curves0 is None else curves0[i]))
-                    curves[-1]["dist"] = dist
-                    which = "baseline" if curves0 is None else "new design"
-                    print(f"DVGeoVSP: found {hostName}-{attName} intersection ({which}) in {time.time() - t1:.3f} s")
-                    i += 1
-        return self.comm.bcast(curves, root=0)
-
-    def _traceCurve(self, h, a, c0=None, nStation=200):
-        """
-        Trace the curve where the attached component a crosses the host component h.
-        On a new design, the host projections start from the baseline curve and the end
-        points reuse the baseline signs. Stations lost this way are traced again with
-        global projections.
-        """
-        host = self.allComps[h]
-        att = self.allComps[a]
-        w = np.linspace(0.0, 1.0, nStation + 1)[:-1] if c0 is None else c0["w"]
-        g = None if c0 is None else (c0["uh"], c0["wh"])
-
-        u, uh, wh, X, valid, sLo = self._bisect(host, att, w, g, None if c0 is None else c0["sLo"])
-        if g is not None and not valid.all():
-            bad = ~valid
-            u[bad], uh[bad], wh[bad], X[bad], valid[bad], _ = self._bisect(host, att, w[bad])
-
-        if c0 is None:
-            # baseline: drop the stations that do not cross the host
-            u, w, uh, wh, X, sLo = u[valid], w[valid], uh[valid], wh[valid], X[valid], sLo[valid]
-        else:
-            # keep the baseline stations; a station that no longer crosses moves with the attached component
-            u, uh, wh, sLo = c0["u"], c0["uh"], c0["wh"], c0["sLo"]
-            if not valid.all():
-                print(f"DVGeoVSP warning: {self.compNames[a]} intersection lost at {np.sum(~valid)} of {len(w)} stations")
-
-        # the attached and host surfaces evaluated at the baseline curve parameters
-        Xa = self._evalSurf(att, u, w)
-        Xh = self._evalSurf(host, uh, wh)
-        if c0 is not None:
-            X = np.where(valid[:, None], X, Xa)
-        return {"host": h, "att": a, "u": u, "w": w, "uh": uh, "wh": wh, "X": X, "Xa": Xa, "Xh": Xh, "sLo": sLo}
-
-    def _bisect(self, host, att, w, guess=None, sLo=None, nIter=20):
-        """
-        At each station w around the attached component, bisect along u (span) for the
-        point where the signed distance to the host changes sign. Each host projection
-        starts from the previous one. sLo is the sign at the root (u = 0); if it is given,
-        it is reused and the end points are not evaluated.
-        """
-        lo = np.zeros(len(w))
-        hi = np.ones(len(w))
-        if sLo is None:
-            fLo = self._signedDist(host, att, lo, w, guess)[0]
-            fHi, uh, wh, _, _ = self._signedDist(host, att, hi, w, guess)
-            sLo = np.sign(fLo)
-            valid = sLo != np.sign(fHi)
-        else:
-            uh, wh = guess
-            valid = np.ones(len(w), dtype=bool)
-        for _ in range(nIter):
-            mid = 0.5 * (lo + hi)
-            f, uh, wh, _, _ = self._signedDist(host, att, mid, w, (uh, wh))
-            same = np.sign(f) == sLo
-            lo = np.where(same, mid, lo)
-            hi = np.where(same, hi, mid)
-        u = 0.5 * (lo + hi)
-        _, uh, wh, X, d = self._signedDist(host, att, u, w, (uh, wh))
-        # a node that is not on the host surface means the bisection did not find the intersection
-        return u, uh, wh, X, valid & (d < self.projTol), sLo
-
-    def _signedDist(self, host, att, u, w, guess=None):
-        """
-        Signed distance from the attached surface points at (u, w) to the host surface.
-        Only the sign change matters, so the orientation of the host normal does not.
-        guess is the host (u, w) to start the projection from; without it the projection is global.
-        """
-        p = self.vspModel.CompVecPnt01(att, 0, u.tolist(), w.tolist())
-        if guess is None:
-            uh, wh, d = self.vspModel.ProjVecPnt01(host, 0, p)
-        else:
-            uh, wh, d = self.vspModel.ProjVecPnt01Guess(host, 0, p, guess[0].tolist(), guess[1].tolist())
-        uh = np.array(uh)
-        wh = np.array(wh)
-        q = self._evalSurf(host, uh, wh)
-        n = self.vspModel.CompVecNorm01(host, 0, uh.tolist(), wh.tolist())
-        n = np.array([[v.x(), v.y(), v.z()] for v in n])
-        X = np.array([[v.x(), v.y(), v.z()] for v in p]) * self.modelScale
-        return np.sum((X - q) * n, axis=1), uh, wh, X, np.array(d) * self.modelScale
-
-    def _toVec3d(self, X):
-        """
-        Convert an array of points in mesh units to a list of VSP vec3d.
-        """
-        return [openvsp.vec3d(float(x), float(y), float(z)) for x, y, z in X / self.modelScale]
-
-    def _evalSurf(self, comp, u, w):
-        """
-        Evaluate surface 0 of a component at (u, w) in mesh units.
-        """
-        p = self.vspModel.CompVecPnt01(comp, 0, u.tolist(), w.tolist())
-        return np.array([[v.x(), v.y(), v.z()] for v in p]) * self.modelScale
-
     def _updateProjectedPts(self):
         """
         Internally updates the coordinates of the projected points.
@@ -1366,6 +1202,421 @@ class DVGeometryVSP(DVGeoSketch):
         self.sizes = sizes
         self.cumSizes = cumSizes
         self.uv = uv
+
+
+class JunctionBlending:
+    """
+    Blends the surface mesh near the junctions of the moving components of a DVGeometryVSP, so
+    that moving a component does not tear its junctions. The intersection curves of each moving
+    component with all other overlapping components are traced on the baseline and followed on
+    every new design. The points within the blending distance of a curve follow its motion in
+    the surface coordinates (u, w) of their own component, with a smoothstep weight that is one
+    on the curve and zero at the blending distance, so they stay on their component. Only the
+    surface evaluations of OpenVSP are used, because its projection functions can crash or return
+    the guess unchanged for some inputs.
+
+    Parameters
+    ----------
+    vspModel : module
+        The openvsp module with the loaded model, at the baseline design.
+    allComps : list of str
+        The IDs of the components.
+    compNames : list of str
+        The names of the components.
+    bbox : dict
+        The bounding box of each component, keyed by its ID.
+    blendComps : list of str
+        The names of the moving components.
+    blendScale : float
+        The blending distance of each curve as a fraction of the largest distance between two of its points.
+    modelScale : float
+        The scale from the VSP model to the mesh units.
+    projTol : float
+        The distance tolerance for a point on a surface, in mesh units.
+    comm : MPI communicator
+    """
+
+    def __init__(self, vspModel, allComps, compNames, bbox, blendComps, blendScale, modelScale, projTol, comm):
+        self.vspModel = vspModel
+        self.allComps = allComps
+        self.compNames = compNames
+        self.bbox = bbox
+        self.blendComps = blendComps
+        self.blendScale = blendScale
+        self.modelScale = modelScale
+        self.projTol = projTol
+        self.comm = comm
+        # whether the surface of each component is closed in w
+        self.closedW = {}
+        # the blending data of each point set
+        self.pointSets = {}
+        # the baseline curves and the curves of the current design
+        self.curves0 = self._traceCurves()
+        self.curves = self.curves0
+
+    def addPointSet(self, ptName, points, geom):
+        """
+        Pair the points of the components of each curve with its nearest exposed node, and find the
+        surface (u, w) and the offset of each blended point on its own component. geom is the
+        component index of each point.
+        """
+        # External modules
+        from scipy.spatial import cKDTree
+
+        blend = []
+        for i, c in enumerate(self.curves0):
+            nodes = np.where(c.exp)[0]
+            for g in (c.a, c.b):
+                idx = np.where(geom == g)[0]
+                if len(idx) == 0:
+                    continue
+                d, k = cKDTree(c.X[nodes]).query(points[idx])
+                k = nodes[k]
+                # smoothstep weight: one with zero slope on the curve, zero at the blending distance
+                s = np.clip(d / c.dist, 0.0, 1.0)
+                wt = 1.0 - 3.0 * s**2 + 2.0 * s**3
+                keep = wt > 0.0
+                blend.append((i, g, idx[keep], k[keep], wt[keep]))
+
+        # the projection of each blended point starts from the nearest point of a grid on its component
+        t1 = time.time()
+        surf = []
+        allIdx = np.unique(np.concatenate([b[2] for b in blend] + [np.zeros(0, dtype=int)]))
+        for g in np.unique(geom[allIdx]):
+            idx = allIdx[geom[allIdx] == g]
+            comp = self.allComps[g]
+            u, w, _ = self._project(comp, points[idx], *self._gridGuess(comp, points[idx]))
+            surf.append((g, idx, u, w, points[idx] - self._evalSurf(comp, u, w)))
+        self.pointSets[ptName] = (blend, surf)
+        if self.comm.rank == 0:
+            print(f"DVGeoVSP: found surface coordinates of {len(allIdx)} blended points in {time.time() - t1:.3f} s")
+
+    def setDesign(self):
+        """
+        Follow the curves on the current design of the VSP model.
+        """
+        self.curves = self._traceCurves(self.curves0)
+
+    def update(self, ptName, newPts):
+        """
+        Move the blended points of a point set in the surface coordinates of their own component.
+        A point at fixed (u, w) already follows its component, so the shift is the motion of the
+        nearest node of the curve in the (u, w) of that component, scaled by the blending weight.
+        Where the blending zones of several curves overlap, the weights are normalized to sum to at
+        most one. Each point keeps its baseline offset from its component.
+        """
+        t1 = time.time()
+        blend, surf = self.pointSets[ptName]
+        dU = np.zeros(len(newPts))
+        dW = np.zeros(len(newPts))
+        wSum = np.zeros(len(newPts))
+        for i, g, idx, k, wt in blend:
+            c0, c = self.curves0[i], self.curves[i]
+            if g == c.a:
+                # the stations are fixed, so the points of a only move along u
+                du, dw = c.u - c0.u, np.zeros(len(c.u))
+            else:
+                du, dw = c.uB - c0.uB, self._wrapW(self.allComps[g], c.wB - c0.wB + 0.5) - 0.5
+            dU[idx] += wt * du[k]
+            dW[idx] += wt * dw[k]
+            wSum[idx] += wt
+        dU /= np.maximum(wSum, 1.0)
+        dW /= np.maximum(wSum, 1.0)
+
+        newPts = newPts.copy()
+        nPts = 0
+        for g, idx, u0, w0, off in surf:
+            comp = self.allComps[g]
+            u = np.clip(u0 + dU[idx], 0.0, 1.0)
+            w = self._wrapW(comp, w0 + dW[idx])
+            newPts[idx] = self._evalSurf(comp, u, w) + off
+            nPts += len(idx)
+        if self.comm.rank == 0:
+            print(f"DVGeoVSP: blended {nPts} points (rank 0) in {time.time() - t1:.3f} s")
+        return newPts
+
+    def _traceCurves(self, curves0=None):
+        """
+        Trace the intersection curves of the moving components in blendComps on the root proc
+        and broadcast them. Without curves0, this finds the curves of each moving component with
+        all other components whose bounding boxes overlap it on the baseline. With curves0, the
+        same curves are followed on the current design.
+        """
+        # External modules
+        from scipy.spatial.distance import pdist
+
+        curves = []
+        if self.comm.rank == 0:
+            if curves0 is None:
+                for a, b in self._findPairs():
+                    t1 = time.time()
+                    # the curve wraps around one of the two components, so that each station of that
+                    # component crosses the curve once; it is the one with more crossing stations
+                    c = max(self._findCurve(a, b), self._findCurve(b, a), key=lambda c: len(c.w))
+                    if np.sum(c.exp) < 2:
+                        continue
+                    # the blending distance is the scale times the largest extent of the junction
+                    c.dist = self.blendScale * pdist(c.X[c.exp]).max()
+                    curves.append(c)
+                    print(f"DVGeoVSP: found {self._name(c)} intersection (baseline) in {time.time() - t1:.3f} s")
+            else:
+                for c0 in curves0:
+                    t1 = time.time()
+                    c = self._followCurve(c0)
+                    curves.append(c)
+                    print(f"DVGeoVSP: found {self._name(c)} intersection (new design) in {time.time() - t1:.3f} s")
+                    self._checkCurve(c, c0)
+        return self.comm.bcast(curves, root=0)
+
+    def _findPairs(self):
+        """
+        The pairs of a moving component and another component whose bounding boxes overlap.
+        A pair of two moving components is listed once.
+        """
+        moving = []
+        for name in self.blendComps:
+            if name not in self.compNames:
+                print(f"DVGeoVSP: skipping {name} (component not found)")
+                continue
+            moving.append(self.compNames.index(name))
+        pairs = []
+        for m in moving:
+            for o in range(len(self.allComps)):
+                if o == m or (o in moving and o < m) or not self._overlap(m, o):
+                    continue
+                pairs.append((m, o))
+        return pairs
+
+    def _findCurve(self, a, b, nStation=200):
+        """
+        Find the baseline curve where the component a crosses the component b along the stations
+        of a, i.e., the lines of constant w on a. Only the stations whose two ends are on opposite
+        sides of b are kept. A node is exposed if it lies outside all other components; only the
+        exposed nodes form the junction, so the parts of the curve buried in a third component are not used.
+
+        A curve has the components a and b (indices in allComps) and, at each station w of a, the
+        crossing u on a, which is (uB, wB) on b, the sign sLo of the distance to b at u = 0, the
+        point X, whether the crossing was found (valid), whether the node is exposed on the
+        baseline (exp), and the blending distance dist.
+        """
+        w = np.arange(nStation) / nStation
+        sLo, cross, guess = self._ends(a, b, w)
+        w, sLo, guess = w[cross], sLo[cross], (guess[0][cross], guess[1][cross])
+        u, uB, wB, valid = self._bisect(a, b, w, sLo, guess)
+        w, u, uB, wB, sLo = w[valid], u[valid], uB[valid], wB[valid], sLo[valid]
+        X = self._evalSurf(self.allComps[a], u, w)
+        valid = np.ones(len(w), dtype=bool)
+        return SimpleNamespace(a=a, b=b, w=w, u=u, uB=uB, wB=wB, sLo=sLo, X=X, valid=valid, exp=self._outside(X, (a, b)), dist=0.0)
+
+    def _followCurve(self, c0):
+        """
+        Follow the baseline curve c0 on the current design. The projections onto b start from the
+        baseline curve and the end points reuse the baseline signs. The stations lost this way are
+        traced again from their end points; a station that no longer crosses b does not move.
+        Which nodes are exposed is decided on the baseline, so that the curve changes smoothly.
+        """
+        a, b = c0.a, c0.b
+        u, uB, wB, valid = self._bisect(a, b, c0.w, c0.sLo, (c0.uB, c0.wB))
+        if not valid.all():
+            i = np.where(~valid)[0]
+            sLo, cross, guess = self._ends(a, b, c0.w[i])
+            i, sLo, guess = i[cross], sLo[cross], (guess[0][cross], guess[1][cross])
+            u[i], uB[i], wB[i], valid[i] = self._bisect(a, b, c0.w[i], sLo, guess)
+        u, uB, wB = np.where(valid, u, c0.u), np.where(valid, uB, c0.uB), np.where(valid, wB, c0.wB)
+        X = self._evalSurf(self.allComps[a], u, c0.w)
+        return SimpleNamespace(a=a, b=b, w=c0.w, u=u, uB=uB, wB=wB, sLo=c0.sLo, X=X, valid=valid, exp=c0.exp, dist=c0.dist)
+
+    def _checkCurve(self, c, c0):
+        """
+        Warn if the curve c no longer exists at some of its exposed stations, or if it moved so far
+        relative to one of its components that the blending may fold the mesh, which happens at
+        about 2/3 of the blending distance for the smoothstep weight.
+        """
+        nLost = np.sum(c0.exp & ~c.valid)
+        if nLost > 0:
+            print(
+                f"DVGeoVSP warning: {self._name(c)} no longer intersects at {nLost} stations, "
+                "the mesh there is not valid; change the geometry or reduce the design change"
+            )
+        e = c0.exp & c.valid
+        if e.any():
+            moveA = np.linalg.norm(c.X[e] - self._evalSurf(self.allComps[c.a], c0.u[e], c0.w[e]), axis=1)
+            moveB = np.linalg.norm(c.X[e] - self._evalSurf(self.allComps[c.b], c0.uB[e], c0.wB[e]), axis=1)
+            ratio = max(moveA.max(), moveB.max()) / c.dist
+            if ratio > 0.5:
+                print(f"DVGeoVSP warning: {self._name(c)} intersection moved {ratio:.2f} of its blending distance, the mesh may fold")
+
+    def _name(self, c):
+        """
+        The name of the curve c, with the component b first, e.g., Fuselage-Wing.
+        """
+        return f"{self.compNames[c.b]}-{self.compNames[c.a]}"
+
+    def _ends(self, a, b, w):
+        """
+        The signed distance to b at the two ends (u = 0 and u = 1) of the stations w of a. Returns the
+        sign at u = 0, whether the two ends are on opposite sides of b, and the (u, w) on b of the
+        end at u = 1, used to start the bisection.
+        """
+        fLo = self._signedDist(a, b, np.zeros(len(w)), w)[0]
+        fHi, uB, wB, _ = self._signedDist(a, b, np.ones(len(w)), w)
+        return np.sign(fLo), np.sign(fLo) != np.sign(fHi), (uB, wB)
+
+    def _bisect(self, a, b, w, sLo, guess, nIter=20):
+        """
+        At each station w of a, bisect along u for the point where the signed distance to b
+        changes sign from sLo, the sign at u = 0. Each projection onto b starts from the previous
+        one, from guess at first. Returns u, the (u, w) of the crossing on b, and whether the
+        crossing lies on b, which fails if the station no longer crosses b.
+        """
+        lo = np.zeros(len(w))
+        hi = np.ones(len(w))
+        uB, wB = guess
+        for _ in range(nIter):
+            mid = 0.5 * (lo + hi)
+            f, uB, wB, _ = self._signedDist(a, b, mid, w, (uB, wB))
+            same = np.sign(f) == sLo
+            lo = np.where(same, mid, lo)
+            hi = np.where(same, hi, mid)
+        u = 0.5 * (lo + hi)
+        _, uB, wB, d = self._signedDist(a, b, u, w, (uB, wB))
+        return u, uB, wB, d < self.projTol
+
+    def _signedDist(self, a, b, u, w, guess=None):
+        """
+        Signed distance from the points at (u, w) on a to the surface of b, the (u, w) of their
+        closest points on b, and the distance. Only the sign change matters, so the orientation of
+        the normal does not. guess is the (u, w) on b to start the projection from; without it,
+        the projection starts from a grid on b.
+        """
+        compA, compB = self.allComps[a], self.allComps[b]
+        X = self._evalSurf(compA, u, w)
+        if guess is None:
+            guess = self._gridGuess(compB, X)
+        uB, wB, d = self._project(compB, X, guess[0], guess[1])
+        n = self.vspModel.CompVecNorm01(compB, 0, uB.tolist(), wB.tolist())
+        n = np.array([[v.x(), v.y(), v.z()] for v in n]).reshape(-1, 3)
+        return np.sum((X - self._evalSurf(compB, uB, wB)) * n, axis=1), uB, wB, d
+
+    def _outside(self, X, skip):
+        """
+        Whether the points X are outside all components except the ones in skip, using the
+        signed distance to the surface of each component whose bounding box contains a point.
+        The surface normals of OpenVSP point outward.
+        """
+        inside = np.zeros(len(X), dtype=bool)
+        for c, comp in enumerate(self.allComps):
+            if c in skip:
+                continue
+            b = self.bbox[comp]
+            m = np.where(np.all((X >= b[:, 0]) & (X <= b[:, 1]), axis=1))[0]
+            if len(m) == 0:
+                continue
+            u, w, _ = self._project(comp, X[m], *self._gridGuess(comp, X[m]))
+            n = self.vspModel.CompVecNorm01(comp, 0, u.tolist(), w.tolist())
+            n = np.array([[v.x(), v.y(), v.z()] for v in n]).reshape(-1, 3)
+            inside[m] = np.sum((X[m] - self._evalSurf(comp, u, w)) * n, axis=1) < 0.0
+        return ~inside
+
+    def _overlap(self, a, b):
+        """
+        Whether the bounding boxes of the components a and b overlap.
+        """
+        ba, bb = self.bbox[self.allComps[a]], self.bbox[self.allComps[b]]
+        return bool(np.all(ba[:, 0] <= bb[:, 1]) and np.all(bb[:, 0] <= ba[:, 1]))
+
+    def _project(self, comp, X, u, w, nIter=20, nSearch=10):
+        """
+        Closest points on surface 0 of a component to the points X (mesh units), starting from (u, w).
+        This uses a damped Gauss-Newton method with finite-difference derivatives and a backtracking
+        line search, and keeps u and w in [0, 1]; w wraps around if the surface is closed in w.
+        Only surface evaluations are used, because the OpenVSP projection functions can crash or
+        return the guess unchanged for some inputs. Returns u, w and the distance.
+        """
+        h = 1e-6
+        closed = self._closedW(comp)
+        u = np.clip(np.array(u, dtype=float), 0.0, 1.0)
+        w = self._wrapW(comp, np.array(w, dtype=float))
+        S = self._evalSurf(comp, u, w)
+        f = np.sum((S - X) ** 2, axis=1)
+        act = np.arange(len(u))
+        for _ in range(nIter):
+            if len(act) == 0:
+                break
+            ua, wa, Sa, Xa = u[act], w[act], S[act], X[act]
+            # one-sided finite differences that stay inside the bounds
+            hu = np.where(ua + h > 1.0, -h, h)
+            hw = np.where(wa + h > 1.0, -h, h) if not closed else h * np.ones(len(act))
+            Su = (self._evalSurf(comp, ua + hu, wa) - Sa) / hu[:, None]
+            Sw = (self._evalSurf(comp, ua, self._wrapW(comp, wa + hw)) - Sa) / hw[:, None]
+            # Gauss-Newton step with a small damping for degenerate points, e.g., the nose of a fuselage
+            r = Sa - Xa
+            a, b, c = np.sum(Su * Su, axis=1), np.sum(Su * Sw, axis=1), np.sum(Sw * Sw, axis=1)
+            gu, gw = np.sum(Su * r, axis=1), np.sum(Sw * r, axis=1)
+            lam = 1e-6 * (a + c) + 1e-30
+            det = (a + lam) * (c + lam) - b * b
+            du = -((c + lam) * gu - b * gw) / det
+            dw = -((a + lam) * gw - b * gu) / det
+            # limit the step to a quarter of the parameter range
+            scale = np.maximum(1.0, np.maximum(np.abs(du), np.abs(dw)) / 0.25)
+            du, dw = du / scale, dw / scale
+            # backtracking line search: halve the step until the distance decreases
+            alpha = np.ones(len(act))
+            done = np.zeros(len(act), dtype=bool)
+            for _ in range(nSearch):
+                j = np.where(~done)[0]
+                un = np.clip(ua[j] + alpha[j] * du[j], 0.0, 1.0)
+                wn = self._wrapW(comp, wa[j] + alpha[j] * dw[j])
+                Sn = self._evalSurf(comp, un, wn)
+                fn = np.sum((Sn - Xa[j]) ** 2, axis=1)
+                ok = fn < f[act[j]]
+                k = act[j[ok]]
+                u[k], w[k], S[k], f[k] = un[ok], wn[ok], Sn[ok], fn[ok]
+                done[j[ok]] = True
+                alpha[j[~ok]] *= 0.5
+                if done.all():
+                    break
+            # keep iterating only the points that moved by more than a tiny step
+            step = alpha * np.maximum(np.abs(du), np.abs(dw))
+            act = act[done & (step > 1e-12)]
+        return u, w, np.sqrt(f)
+
+    def _closedW(self, comp):
+        """
+        Whether surface 0 of a component is closed in w, i.e., its w = 0 and w = 1 edges coincide,
+        e.g., a fuselage or a wing. This does not change with the design, so it is computed once.
+        """
+        if comp not in self.closedW:
+            uc = np.linspace(0.0, 1.0, 11)
+            gap = np.abs(self._evalSurf(comp, uc, np.zeros(11)) - self._evalSurf(comp, uc, np.ones(11))).max()
+            size = np.abs(self._evalSurf(comp, uc, 0.5 * np.ones(11))).max()
+            self.closedW[comp] = gap < 1e-8 * max(1.0, size)
+        return self.closedW[comp]
+
+    def _wrapW(self, comp, w):
+        """
+        Wrap w into [0, 1) if the surface of the component is closed in w, otherwise clip it to [0, 1].
+        """
+        return np.mod(w, 1.0) if self._closedW(comp) else np.clip(w, 0.0, 1.0)
+
+    def _gridGuess(self, comp, X, n=101):
+        """
+        Surface (u, w) of the nearest point of a uniform n x n grid on surface 0 of a component,
+        used to start the projection of points without a guess.
+        """
+        # External modules
+        from scipy.spatial import cKDTree
+
+        ug, wg = [x.ravel() for x in np.meshgrid(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, n))]
+        k = cKDTree(self._evalSurf(comp, ug, wg)).query(X)[1]
+        return ug[k], wg[k]
+
+    def _evalSurf(self, comp, u, w):
+        """
+        Evaluate surface 0 of a component at (u, w) in mesh units.
+        """
+        p = self.vspModel.CompVecPnt01(comp, 0, u.tolist(), w.tolist())
+        return np.array([[v.x(), v.y(), v.z()] for v in p]).reshape(-1, 3) * self.modelScale
 
 
 class PointSet:
