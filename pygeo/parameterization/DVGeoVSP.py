@@ -1322,14 +1322,14 @@ class JunctionBlending:
             gathered = self.comm.allgather((points[on], geom[on]))
             X = np.concatenate([e[0] for e in gathered] + [np.zeros((0, 3))])
             G = np.concatenate([e[1] for e in gathered] + [np.zeros(0, dtype=int)])
-            lines += [(g, X[G == g]) for g in np.unique(G)]
+            lines += [(g, X[G == g], self._tangent(X[G == g])) for g in np.unique(G) if np.sum(G == g) >= 2]
         for c in self.fixed:
-            lines += [(c.a, c.X[c.exp]), (c.b, c.X[c.exp])]
+            lines += [(c.a, c.X[c.exp], c.T[c.exp]), (c.b, c.X[c.exp], c.T[c.exp])]
         fade = np.full(len(points), np.inf)
         for i, g, idx, k, wt in blend:
             fade[idx] = np.minimum(fade[idx], 0.25 * self.curves0[i].dist)
         fix = []
-        for g, X in lines:
+        for g, X, T in lines:
             idx = allIdx[geom[allIdx] == g]
             if len(X) < 2 or len(idx) == 0:
                 continue
@@ -1337,7 +1337,7 @@ class JunctionBlending:
             s = np.clip(d / fade[idx], 0.0, 1.0)
             m = 1.0 - 3.0 * s**2 + 2.0 * s**3
             keep = m > 0.0
-            fix.append((idx[keep], self._tangent(X)[k[keep]], m[keep]))
+            fix.append((idx[keep], T[k[keep]], m[keep]))
 
         self.pointSets[ptName] = SimpleNamespace(blend=blend, surf=surf, Su=Su, Sw=Sw, fix=fix, onSym=self._onSym(points))
         if self.comm.rank == 0:
@@ -1420,6 +1420,14 @@ class JunctionBlending:
                     c = max(self._findCurve(a, b), self._findCurve(b, a), key=lambda c: len(c.w))
                     if np.sum(c.exp) < 2:
                         continue
+                    # the unit tangent from the neighboring nodes in station order, which wraps around if a
+                    # is closed in w, so that nodes of other parts of the curve, e.g., the other side of a
+                    # thin fin, are not mixed in
+                    if self._closedW(self.allComps[a]):
+                        c.T = np.roll(c.X, -1, axis=0) - np.roll(c.X, 1, axis=0)
+                    else:
+                        c.T = np.gradient(c.X, axis=0)
+                    c.T /= np.linalg.norm(c.T, axis=1, keepdims=True) + 1e-300
                     fixed.append(c)
                     print(f"DVGeoVSP: found {self._name(c)} intersection (stationary) in {time.time() - t1:.3f} s")
         return self.comm.bcast(fixed, root=0)
