@@ -71,7 +71,11 @@ class DVGeometryVSP(DVGeoSketch):
        and trimmed to the parts outside all other components. Points within
        the blending distance of a curve follow its motion in the surface
        coordinates of their own component with a smooth falloff, so moving a
-       component does not tear its junctions. See :class:`JunctionBlending`.
+       component does not tear its junctions. The junctions between two
+       components that do not move, e.g., the fin-fuselage junction when only
+       the tail moves, and the edges of the components on the symmetry plane
+       are stationary lines: near them, the points only slide along the line.
+       See :class:`JunctionBlending`.
        The blending is not included in the Jacobian.
 
     blendScale : float, optional
@@ -79,6 +83,12 @@ class DVGeometryVSP(DVGeoSketch):
        the largest distance between two points of the curve, e.g., the root
        chord for a wing. A larger scale spreads the motion of a junction over
        a larger region, which allows larger motions before the mesh folds.
+
+    symPlane : str or None, optional
+       The symmetry plane of a half-model mesh: "x", "y", or "z" for the
+       plane x = 0, y = 0, or z = 0, or None for a full model. The crossings
+       on this plane are not junctions, and the edges of the components on it
+       are stationary lines, so that the points on it only slide along it.
 
     Examples
     --------
@@ -90,7 +100,7 @@ class DVGeometryVSP(DVGeoSketch):
 
     """
 
-    def __init__(self, fileName, comm=MPI.COMM_WORLD, scale=1.0, comps=[], projTol=0.01, name=None, blendComps=None, blendScale=0.3):
+    def __init__(self, fileName, comm=MPI.COMM_WORLD, scale=1.0, comps=[], projTol=0.01, name=None, blendComps=None, blendScale=0.3, symPlane="y"):
         vspOutOfDate = False
         if vspInstalled:
             vspVersionStr = openvsp.GetVSPVersion()
@@ -176,7 +186,7 @@ class DVGeometryVSP(DVGeoSketch):
         self.blending = None
         if blendComps:
             self.blending = JunctionBlending(
-                self.vspModel, self.allComps, self.compNames, self.bbox, blendComps, blendScale, self.modelScale, self.projTol, comm
+                self.vspModel, self.allComps, self.compNames, self.bbox, blendComps, blendScale, symPlane, self.modelScale, self.projTol, comm
             )
 
         if comm.rank == 0:
@@ -1229,6 +1239,8 @@ class JunctionBlending:
         The names of the moving components.
     blendScale : float
         The blending distance of each curve as a fraction of the largest distance between two of its points.
+    symPlane : str or None
+        The symmetry plane of a half-model mesh, "x", "y", or "z", or None for a full model.
     modelScale : float
         The scale from the VSP model to the mesh units.
     projTol : float
@@ -1236,7 +1248,7 @@ class JunctionBlending:
     comm : MPI communicator
     """
 
-    def __init__(self, vspModel, allComps, compNames, bbox, blendComps, blendScale, modelScale, projTol, comm):
+    def __init__(self, vspModel, allComps, compNames, bbox, blendComps, blendScale, symPlane, modelScale, projTol, comm):
         self.vspModel = vspModel
         self.allComps = allComps
         self.compNames = compNames
@@ -1248,17 +1260,26 @@ class JunctionBlending:
         self.comm = comm
         # whether the surface of each component is closed in w
         self.closedW = {}
+        # the axis normal to the symmetry plane of a half-model mesh; the crossings on that plane are not
+        # junctions, since the plane is not a wall, and the points on it are not blended
+        self.symAxis = None if symPlane is None else "xyz".index(symPlane)
+        size = max(np.abs(b).max() for b in bbox.values())
+        self.symTol = 1e-6 * size
         # the blending data of each point set
         self.pointSets = {}
         # the baseline curves and the curves of the current design
         self.curves0 = self._traceCurves()
+        # the junctions that do not move, of the components that a moving junction touches
+        self.fixed = self._traceFixed()
         self.curves = self.curves0
 
     def addPointSet(self, ptName, points, geom):
         """
-        Pair the points of the components of each curve with its nearest exposed node, and find the
-        surface (u, w) and the offset of each blended point on its own component. geom is the
-        component index of each point.
+        Pair the points of the components of each moving curve with its nearest exposed node, and find
+        the surface (u, w), offset, and surface derivatives of each blended point on its own component.
+        Also find the stationary lines near each blended point: the edges of its component on the
+        symmetry plane and its junctions with components that do not move. geom is the component index
+        of each point.
         """
         # External modules
         from scipy.spatial import cKDTree
@@ -1281,13 +1302,44 @@ class JunctionBlending:
         # the projection of each blended point starts from the nearest point of a grid on its component
         t1 = time.time()
         surf = []
+        Su = np.zeros((len(points), 3))
+        Sw = np.zeros((len(points), 3))
         allIdx = np.unique(np.concatenate([b[2] for b in blend] + [np.zeros(0, dtype=int)]))
         for g in np.unique(geom[allIdx]):
             idx = allIdx[geom[allIdx] == g]
             comp = self.allComps[g]
             u, w, _ = self._project(comp, points[idx], *self._gridGuess(comp, points[idx]))
             surf.append((g, idx, u, w, points[idx] - self._evalSurf(comp, u, w)))
-        self.pointSets[ptName] = (blend, surf)
+            Su[idx], Sw[idx] = self._derivs(comp, u, w)
+
+        # The stationary lines of each component: its edge on the symmetry plane, from its points on the
+        # plane gathered from all procs, and the exposed nodes of its junctions with components that do not
+        # move. Near them, only the shift along the line is kept, which fades in over a quarter of the
+        # smallest blending distance of the point's curves.
+        lines = []
+        if self.symAxis is not None:
+            on = self._onSym(points)
+            gathered = self.comm.allgather((points[on], geom[on]))
+            X = np.concatenate([e[0] for e in gathered] + [np.zeros((0, 3))])
+            G = np.concatenate([e[1] for e in gathered] + [np.zeros(0, dtype=int)])
+            lines += [(g, X[G == g]) for g in np.unique(G)]
+        for c in self.fixed:
+            lines += [(c.a, c.X[c.exp]), (c.b, c.X[c.exp])]
+        fade = np.full(len(points), np.inf)
+        for i, g, idx, k, wt in blend:
+            fade[idx] = np.minimum(fade[idx], 0.25 * self.curves0[i].dist)
+        fix = []
+        for g, X in lines:
+            idx = allIdx[geom[allIdx] == g]
+            if len(X) < 2 or len(idx) == 0:
+                continue
+            d, k = cKDTree(X).query(points[idx])
+            s = np.clip(d / fade[idx], 0.0, 1.0)
+            m = 1.0 - 3.0 * s**2 + 2.0 * s**3
+            keep = m > 0.0
+            fix.append((idx[keep], self._tangent(X)[k[keep]], m[keep]))
+
+        self.pointSets[ptName] = SimpleNamespace(blend=blend, surf=surf, Su=Su, Sw=Sw, fix=fix, onSym=self._onSym(points))
         if self.comm.rank == 0:
             print(f"DVGeoVSP: found surface coordinates of {len(allIdx)} blended points in {time.time() - t1:.3f} s")
 
@@ -1303,14 +1355,15 @@ class JunctionBlending:
         A point at fixed (u, w) already follows its component, so the shift is the motion of the
         nearest node of the curve in the (u, w) of that component, scaled by the blending weight.
         Where the blending zones of several curves overlap, the weights are normalized to sum to at
-        most one. Each point keeps its baseline offset from its component.
+        most one. Near a stationary line, only the part of the shift along the line is kept, so that
+        the points on the line stay on it. Each point keeps its baseline offset from its component.
         """
         t1 = time.time()
-        blend, surf = self.pointSets[ptName]
+        ps = self.pointSets[ptName]
         dU = np.zeros(len(newPts))
         dW = np.zeros(len(newPts))
         wSum = np.zeros(len(newPts))
-        for i, g, idx, k, wt in blend:
+        for i, g, idx, k, wt in ps.blend:
             c0, c = self.curves0[i], self.curves[i]
             if g == c.a:
                 # the stations are fixed, so the points of a only move along u
@@ -1323,17 +1376,53 @@ class JunctionBlending:
         dU /= np.maximum(wSum, 1.0)
         dW /= np.maximum(wSum, 1.0)
 
+        # near each stationary line, replace the shift by its part along the line with the weight m
+        for idx, T, m in ps.fix:
+            Su, Sw = ps.Su[idx], ps.Sw[idx]
+            d = Su * dU[idx, None] + Sw * dW[idx, None]
+            d = np.sum(d * T, axis=1)[:, None] * T
+            # the (u, w) of the shift along the line, from the normal equations of the surface derivatives
+            a, b, c = np.sum(Su * Su, axis=1), np.sum(Su * Sw, axis=1), np.sum(Sw * Sw, axis=1)
+            ru, rw = np.sum(Su * d, axis=1), np.sum(Sw * d, axis=1)
+            det = a * c - b * b + 1e-12 * (a + c) ** 2 + 1e-300
+            dU[idx] = (1.0 - m) * dU[idx] + m * (c * ru - b * rw) / det
+            dW[idx] = (1.0 - m) * dW[idx] + m * (a * rw - b * ru) / det
+
         newPts = newPts.copy()
         nPts = 0
-        for g, idx, u0, w0, off in surf:
+        for g, idx, u0, w0, off in ps.surf:
             comp = self.allComps[g]
             u = np.clip(u0 + dU[idx], 0.0, 1.0)
             w = self._wrapW(comp, w0 + dW[idx])
             newPts[idx] = self._evalSurf(comp, u, w) + off
+            # the points on the symmetry plane slide along it, so they stay on it exactly
+            if self.symAxis is not None:
+                newPts[idx[ps.onSym[idx]], self.symAxis] = 0.0
             nPts += len(idx)
         if self.comm.rank == 0:
             print(f"DVGeoVSP: blended {nPts} points (rank 0) in {time.time() - t1:.3f} s")
         return newPts
+
+    def _traceFixed(self):
+        """
+        Trace, on the root proc, the stationary junctions, i.e., between two overlapping components that
+        do not move, e.g., the fin-fuselage junction when only the tail moves. They are traced once on the
+        baseline; near them, the points only slide along the junction.
+        """
+        moving = [self.compNames.index(n) for n in self.blendComps if n in self.compNames]
+        fixed = []
+        if self.comm.rank == 0:
+            for a in range(len(self.allComps)):
+                for b in range(a + 1, len(self.allComps)):
+                    if a in moving or b in moving or not self._overlap(a, b):
+                        continue
+                    t1 = time.time()
+                    c = max(self._findCurve(a, b), self._findCurve(b, a), key=lambda c: len(c.w))
+                    if np.sum(c.exp) < 2:
+                        continue
+                    fixed.append(c)
+                    print(f"DVGeoVSP: found {self._name(c)} intersection (stationary) in {time.time() - t1:.3f} s")
+        return self.comm.bcast(fixed, root=0)
 
     def _traceCurves(self, curves0=None):
         """
@@ -1391,8 +1480,9 @@ class JunctionBlending:
         """
         Find the baseline curve where the component a crosses the component b along the stations
         of a, i.e., the lines of constant w on a. Only the stations whose two ends are on opposite
-        sides of b are kept. A node is exposed if it lies outside all other components; only the
-        exposed nodes form the junction, so the parts of the curve buried in a third component are not used.
+        sides of b are kept. A node is exposed if it lies outside all other components and off the
+        symmetry plane; only the exposed nodes form the junction, so the parts of the curve buried in a
+        third component or lying on the symmetry plane are not used.
 
         A curve has the components a and b (indices in allComps) and, at each station w of a, the
         crossing u on a, which is (uB, wB) on b, the sign sLo of the distance to b at u = 0, the
@@ -1406,13 +1496,15 @@ class JunctionBlending:
         w, u, uB, wB, sLo = w[valid], u[valid], uB[valid], wB[valid], sLo[valid]
         X = self._evalSurf(self.allComps[a], u, w)
         valid = np.ones(len(w), dtype=bool)
-        return SimpleNamespace(a=a, b=b, w=w, u=u, uB=uB, wB=wB, sLo=sLo, X=X, valid=valid, exp=self._outside(X, (a, b)), dist=0.0)
+        exp = self._outside(X, (a, b)) & ~self._onSym(X)
+        return SimpleNamespace(a=a, b=b, w=w, u=u, uB=uB, wB=wB, sLo=sLo, X=X, valid=valid, exp=exp, dist=0.0)
 
     def _followCurve(self, c0):
         """
         Follow the baseline curve c0 on the current design. The projections onto b start from the
         baseline curve and the end points reuse the baseline signs. The stations lost this way are
-        traced again from their end points; a station that no longer crosses b does not move.
+        traced again from their end points; a station that no longer crosses b, or whose crossing
+        moves onto the symmetry plane, does not move.
         Which nodes are exposed is decided on the baseline, so that the curve changes smoothly.
         """
         a, b = c0.a, c0.b
@@ -1422,6 +1514,8 @@ class JunctionBlending:
             sLo, cross, guess = self._ends(a, b, c0.w[i])
             i, sLo, guess = i[cross], sLo[cross], (guess[0][cross], guess[1][cross])
             u[i], uB[i], wB[i], valid[i] = self._bisect(a, b, c0.w[i], sLo, guess)
+        # a crossing that moves onto the symmetry plane is not a junction
+        valid &= ~self._onSym(self._evalSurf(self.allComps[a], u, c0.w))
         u, uB, wB = np.where(valid, u, c0.u), np.where(valid, uB, c0.uB), np.where(valid, wB, c0.wB)
         X = self._evalSurf(self.allComps[a], u, c0.w)
         return SimpleNamespace(a=a, b=b, w=c0.w, u=u, uB=uB, wB=wB, sLo=c0.sLo, X=X, valid=valid, exp=c0.exp, dist=c0.dist)
@@ -1518,6 +1612,14 @@ class JunctionBlending:
             inside[m] = np.sum((X[m] - self._evalSurf(comp, u, w)) * n, axis=1) < 0.0
         return ~inside
 
+    def _onSym(self, X):
+        """
+        Whether the points X lie on the symmetry plane of a half-model mesh.
+        """
+        if self.symAxis is None:
+            return np.zeros(len(X), dtype=bool)
+        return np.abs(X[:, self.symAxis]) < self.symTol
+
     def _overlap(self, a, b):
         """
         Whether the bounding boxes of the components a and b overlap.
@@ -1598,6 +1700,31 @@ class JunctionBlending:
         Wrap w into [0, 1) if the surface of the component is closed in w, otherwise clip it to [0, 1].
         """
         return np.mod(w, 1.0) if self._closedW(comp) else np.clip(w, 0.0, 1.0)
+
+    def _derivs(self, comp, u, w, h=1e-6):
+        """
+        The derivatives of surface 0 of a component with respect to u and w at (u, w), by one-sided
+        finite differences that stay inside the bounds.
+        """
+        S = self._evalSurf(comp, u, w)
+        hu = np.where(u + h > 1.0, -h, h)
+        hw = h * np.ones(len(w)) if self._closedW(comp) else np.where(w + h > 1.0, -h, h)
+        Su = (self._evalSurf(comp, u + hu, w) - S) / hu[:, None]
+        Sw = (self._evalSurf(comp, u, self._wrapW(comp, w + hw)) - S) / hw[:, None]
+        return Su, Sw
+
+    def _tangent(self, X, k=6):
+        """
+        The unit tangent of a line given by its points X at each point, the principal direction of its
+        k nearest points.
+        """
+        # External modules
+        from scipy.spatial import cKDTree
+
+        k = min(k, len(X))
+        N = X[cKDTree(X).query(X, k)[1]]
+        N = N - N.mean(axis=1, keepdims=True)
+        return np.linalg.eigh(np.einsum("nki,nkj->nij", N, N))[1][:, :, -1]
 
     def _gridGuess(self, comp, X, n=101):
         """
