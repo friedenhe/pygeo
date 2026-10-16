@@ -1275,7 +1275,8 @@ class JunctionBlending:
 
     def addPointSet(self, ptName, points, geom):
         """
-        Pair the points of the components of each moving curve with its nearest exposed node, and find
+        Pair the points within the blending distance of each moving curve with its nearest exposed node,
+        including the points of other components, e.g., the fin points near the tail junction, and find
         the surface (u, w), offset, and surface derivatives of each blended point on its own component.
         Also find the stationary lines near each blended point: the edges of its component on the
         symmetry plane and its junctions with components that do not move. geom is the component index
@@ -1287,17 +1288,19 @@ class JunctionBlending:
         blend = []
         for i, c in enumerate(self.curves0):
             nodes = np.where(c.exp)[0]
-            for g in (c.a, c.b):
-                idx = np.where(geom == g)[0]
+            tree = cKDTree(c.X[nodes])
+            # -1 stands for the points of all other components
+            for g in (c.a, c.b, -1):
+                idx = np.where(geom == g)[0] if g >= 0 else np.where((geom != c.a) & (geom != c.b))[0]
                 if len(idx) == 0:
                     continue
-                d, k = cKDTree(c.X[nodes]).query(points[idx])
-                k = nodes[k]
+                d, k = tree.query(points[idx], distance_upper_bound=c.dist)
+                keep = d < c.dist
+                idx, d, k = idx[keep], d[keep], nodes[k[keep]]
                 # smoothstep weight: one with zero slope on the curve, zero at the blending distance
-                s = np.clip(d / c.dist, 0.0, 1.0)
+                s = d / c.dist
                 wt = 1.0 - 3.0 * s**2 + 2.0 * s**3
-                keep = wt > 0.0
-                blend.append((i, g, idx[keep], k[keep], wt[keep]))
+                blend.append((i, g, idx, k, wt))
 
         # the projection of each blended point starts from the nearest point of a grid on its component
         t1 = time.time()
@@ -1353,7 +1356,8 @@ class JunctionBlending:
         """
         Move the blended points of a point set in the surface coordinates of their own component.
         A point at fixed (u, w) already follows its component, so the shift is the motion of the
-        nearest node of the curve in the (u, w) of that component, scaled by the blending weight.
+        nearest node of the curve in the (u, w) of that component, scaled by the blending weight. A point
+        of another component takes the motion of the node in space, along its own surface.
         Where the blending zones of several curves overlap, the weights are normalized to sum to at
         most one. Near a stationary line, only the part of the shift along the line is kept, so that
         the points on the line stay on it. Each point keeps its baseline offset from its component.
@@ -1367,11 +1371,15 @@ class JunctionBlending:
             c0, c = self.curves0[i], self.curves[i]
             if g == c.a:
                 # the stations are fixed, so the points of a only move along u
-                du, dw = c.u - c0.u, np.zeros(len(c.u))
+                du, dw = (c.u - c0.u)[k], np.zeros(len(k))
+            elif g == c.b:
+                du, dw = (c.uB - c0.uB)[k], (self._wrapW(self.allComps[g], c.wB - c0.wB + 0.5) - 0.5)[k]
             else:
-                du, dw = c.uB - c0.uB, self._wrapW(self.allComps[g], c.wB - c0.wB + 0.5) - 0.5
-            dU[idx] += wt * du[k]
-            dW[idx] += wt * dw[k]
+                # the curve has no (u, w) on the other components, so their points take the part of the
+                # motion of the node in space that lies along their surface
+                du, dw = self._toUW(ps.Su[idx], ps.Sw[idx], c.X[k] - c0.X[k])
+            dU[idx] += wt * du
+            dW[idx] += wt * dw
             wSum[idx] += wt
         dU /= np.maximum(wSum, 1.0)
         dW /= np.maximum(wSum, 1.0)
@@ -1380,13 +1388,9 @@ class JunctionBlending:
         for idx, T, m in ps.fix:
             Su, Sw = ps.Su[idx], ps.Sw[idx]
             d = Su * dU[idx, None] + Sw * dW[idx, None]
-            d = np.sum(d * T, axis=1)[:, None] * T
-            # the (u, w) of the shift along the line, from the normal equations of the surface derivatives
-            a, b, c = np.sum(Su * Su, axis=1), np.sum(Su * Sw, axis=1), np.sum(Sw * Sw, axis=1)
-            ru, rw = np.sum(Su * d, axis=1), np.sum(Sw * d, axis=1)
-            det = a * c - b * b + 1e-12 * (a + c) ** 2 + 1e-300
-            dU[idx] = (1.0 - m) * dU[idx] + m * (c * ru - b * rw) / det
-            dW[idx] = (1.0 - m) * dW[idx] + m * (a * rw - b * ru) / det
+            du, dw = self._toUW(Su, Sw, np.sum(d * T, axis=1)[:, None] * T)
+            dU[idx] = (1.0 - m) * dU[idx] + m * du
+            dW[idx] = (1.0 - m) * dW[idx] + m * dw
 
         newPts = newPts.copy()
         nPts = 0
@@ -1720,6 +1724,16 @@ class JunctionBlending:
         Su = (self._evalSurf(comp, u + hu, w) - S) / hu[:, None]
         Sw = (self._evalSurf(comp, u, self._wrapW(comp, w + hw)) - S) / hw[:, None]
         return Su, Sw
+
+    def _toUW(self, Su, Sw, d):
+        """
+        The change in the surface coordinates (u, w) whose shift Su du + Sw dw is closest to the shift d of
+        each point, from the normal equations of the surface derivatives.
+        """
+        a, b, c = np.sum(Su * Su, axis=1), np.sum(Su * Sw, axis=1), np.sum(Sw * Sw, axis=1)
+        ru, rw = np.sum(Su * d, axis=1), np.sum(Sw * d, axis=1)
+        det = a * c - b * b + 1e-12 * (a + c) ** 2 + 1e-300
+        return (c * ru - b * rw) / det, (a * rw - b * ru) / det
 
     def _tangent(self, X, k=6):
         """
