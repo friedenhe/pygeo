@@ -76,6 +76,7 @@ class DVGeometryVSP(DVGeoSketch):
        the tail moves, and the edges of the components on the symmetry plane
        are stationary lines: near them, the points only slide along the line.
        See :class:`JunctionBlending`.
+       The baseline curves are written to ``intersect_lines/`` as VTK files.
        The blending is not included in the Jacobian.
 
     blendScale : float, optional
@@ -1272,6 +1273,53 @@ class JunctionBlending:
         # the junctions that do not move, of the components that a moving junction touches
         self.fixed = self._traceFixed()
         self.curves = self.curves0
+        if self.comm.rank == 0:
+            self._writeCurves()
+
+    def _writeCurves(self, dirName="intersect_lines"):
+        """
+        Write the baseline intersection curves to dirName as legacy VTK files for ParaView, named by
+        their components, e.g., moving_Fuselage-Tail.vtk and stationary_Fuselage-TailV.vtk. Each node is
+        connected to the nearest node of the next station if it is closer than three times the median of
+        these distances, so a gap in a curve shows as a break. Each node has whether it is exposed, its
+        station index, the end of the station it was found from (side: 0 from u = 0, 1 from u = 1), and,
+        on a stationary curve, its unit tangent T.
+        """
+        # Standard Python modules
+        import os
+
+        os.makedirs(dirName, exist_ok=True)
+        for kind, curves in (("moving", self.curves0), ("stationary", self.fixed)):
+            for c in curves:
+                n = len(c.X)
+                closed = self._closedW(self.allComps[c.a])
+                seg = []
+                for i in range(n):
+                    nk = c.k[i] + 1
+                    if nk == c.nStation and closed:
+                        nk = 0
+                    j = np.where(c.k == nk)[0]
+                    if len(j):
+                        dj = np.linalg.norm(c.X[j] - c.X[i], axis=1)
+                        seg.append((i, j[np.argmin(dj)], dj.min()))
+                if seg:
+                    tol = 3.0 * np.median([s[2] for s in seg])
+                    seg = [s for s in seg if s[2] < tol]
+                fileName = os.path.join(dirName, f"{kind}_{self._name(c)}.vtk")
+                with open(fileName, "w") as f:
+                    f.write(f"# vtk DataFile Version 3.0\n{kind} {self._name(c)} intersection, stations of {self.compNames[c.a]}\n")
+                    f.write(f"ASCII\nDATASET POLYDATA\nPOINTS {n} double\n")
+                    f.writelines(f"{p[0]:.10e} {p[1]:.10e} {p[2]:.10e}\n" for p in c.X)
+                    f.write(f"LINES {len(seg)} {3 * len(seg)}\n")
+                    f.writelines(f"2 {i} {j}\n" for i, j, _ in seg)
+                    f.write(f"POINT_DATA {n}\n")
+                    for name, v in (("exposed", c.exp), ("station", c.k), ("side", c.side)):
+                        f.write(f"SCALARS {name} int 1\nLOOKUP_TABLE default\n")
+                        f.writelines(f"{int(x)}\n" for x in v)
+                    if hasattr(c, "T"):
+                        f.write("VECTORS T double\n")
+                        f.writelines(f"{t[0]:.6e} {t[1]:.6e} {t[2]:.6e}\n" for t in c.T)
+        print(f"DVGeoVSP: wrote the baseline intersection curves to {dirName}/")
 
     def addPointSet(self, ptName, points, geom):
         """
@@ -1424,14 +1472,7 @@ class JunctionBlending:
                     c = max(self._findCurve(a, b), self._findCurve(b, a), key=lambda c: len(c.w))
                     if np.sum(c.exp) < 2:
                         continue
-                    # the unit tangent from the neighboring nodes in station order, which wraps around if a
-                    # is closed in w, so that nodes of other parts of the curve, e.g., the other side of a
-                    # thin fin, are not mixed in
-                    if self._closedW(self.allComps[a]):
-                        c.T = np.roll(c.X, -1, axis=0) - np.roll(c.X, 1, axis=0)
-                    else:
-                        c.T = np.gradient(c.X, axis=0)
-                    c.T /= np.linalg.norm(c.T, axis=1, keepdims=True) + 1e-300
+                    c.T = self._curveTangent(c)
                     fixed.append(c)
                     print(f"DVGeoVSP: found {self._name(c)} intersection (stationary) in {time.time() - t1:.3f} s")
         return self.comm.bcast(fixed, root=0)
@@ -1452,7 +1493,7 @@ class JunctionBlending:
                 for a, b in self._findPairs():
                     t1 = time.time()
                     # the curve wraps around one of the two components, so that each station of that
-                    # component crosses the curve once; it is the one with more crossing stations
+                    # component crosses the curve; it is the one with more crossing stations
                     c = max(self._findCurve(a, b), self._findCurve(b, a), key=lambda c: len(c.w))
                     if np.sum(c.exp) < 2:
                         continue
@@ -1491,46 +1532,82 @@ class JunctionBlending:
     def _findCurve(self, a, b, nStation=200):
         """
         Find the baseline curve where the component a crosses the component b along the stations
-        of a, i.e., the lines of constant w on a. Only the stations whose two ends are on opposite
-        sides of b are kept. A node is exposed if it lies outside all other components and off the
-        symmetry plane; only the exposed nodes form the junction, so the parts of the curve buried in a
-        third component or lying on the symmetry plane are not used.
+        of a, i.e., the lines of constant w on a. Each station keeps its crossings nearest to its two
+        ends (see _crossings): a station that passes through b gives two nodes, e.g., the upper and
+        lower parts of a fin-fuselage junction, and a station that crosses b once gives one. A node is
+        exposed if it lies outside all other components and off the symmetry plane; only the exposed
+        nodes form the junction, so the parts of the curve buried in a third component or lying on the
+        symmetry plane are not used.
 
-        A curve has the components a and b (indices in allComps) and, at each station w of a, the
-        crossing u on a, which is (uB, wB) on b, the sign sLo of the distance to b at u = 0, the
-        point X, whether the crossing was found (valid), whether the node is exposed on the
-        baseline (exp), and the blending distance dist.
+        A curve has the components a and b (indices in allComps) and, at each node, its station index
+        k and station w on a, the end of the station it was found from (side: 0 from u = 0, 1 from
+        u = 1), the crossing u on a, which is (uB, wB) on b, the interval [lo, hi] of u that contains it
+        and the sign sLo of the distance to b at lo, the point X, whether the crossing was found (valid),
+        whether the node is exposed on the baseline (exp), the blending distance dist, and the number
+        of stations nStation.
         """
         w = np.arange(nStation) / nStation
-        sLo, cross, guess = self._ends(a, b, w)
-        w, sLo, guess = w[cross], sLo[cross], (guess[0][cross], guess[1][cross])
-        u, uB, wB, valid = self._bisect(a, b, w, sLo, guess)
-        w, u, uB, wB, sLo = w[valid], u[valid], uB[valid], wB[valid], sLo[valid]
-        X = self._evalSurf(self.allComps[a], u, w)
-        valid = np.ones(len(w), dtype=bool)
+        (f0, s0, lo0, hi0, u0, uB0, wB0), (f1, s1, lo1, hi1, u1, uB1, wB1) = self._crossings(a, b, w)
+        # a station that crosses b once finds the same crossing from both ends; it is kept once
+        f1 &= ~(f0 & (np.abs(u1 - u0) < 1e-6))
+        k = np.concatenate([np.where(f0)[0], np.where(f1)[0]])
+        side = np.concatenate([np.zeros(np.sum(f0), dtype=int), np.ones(np.sum(f1), dtype=int)])
+        sLo, lo, hi, u, uB, wB = (np.concatenate([v0[f0], v1[f1]]) for v0, v1 in ((s0, s1), (lo0, lo1), (hi0, hi1), (u0, u1), (uB0, uB1), (wB0, wB1)))
+        o = np.argsort(k, kind="stable")
+        k, side, sLo, lo, hi, u, uB, wB = (v[o] for v in (k, side, sLo, lo, hi, u, uB, wB))
+        X = self._evalSurf(self.allComps[a], u, w[k])
+        valid = np.ones(len(k), dtype=bool)
         exp = self._outside(X, (a, b)) & ~self._onSym(X)
-        return SimpleNamespace(a=a, b=b, w=w, u=u, uB=uB, wB=wB, sLo=sLo, X=X, valid=valid, exp=exp, dist=0.0)
+        return SimpleNamespace(
+            a=a, b=b, k=k, w=w[k], side=side, u=u, uB=uB, wB=wB, sLo=sLo, lo=lo, hi=hi, X=X, valid=valid, exp=exp,
+            dist=0.0, nStation=nStation,
+        )
+
+    def _curveTangent(self, c):
+        """
+        The unit tangent of the curve c at each node, normal to both surfaces, i.e., the cross product
+        of their normals, so that it does not depend on the order or spacing of the nodes. Where the two
+        surfaces are within about 12 degrees of tangent to each other, the cross product is not reliable,
+        and the tangent is the direction to the nearest other node.
+        """
+        # External modules
+        from scipy.spatial import cKDTree
+
+        T = np.cross(self._normal(self.allComps[c.a], c.u, c.w), self._normal(self.allComps[c.b], c.uB, c.wB))
+        s = np.linalg.norm(T, axis=1)
+        bad = np.where(s < 0.2)[0]
+        if len(bad) and len(c.X) > 1:
+            j = cKDTree(c.X).query(c.X[bad], 2)[1][:, 1]
+            T[bad] = c.X[j] - c.X[bad]
+            s[bad] = np.linalg.norm(T[bad], axis=1)
+        return T / (s[:, None] + 1e-300)
 
     def _followCurve(self, c0):
         """
-        Follow the baseline curve c0 on the current design. The projections onto b start from the
-        baseline curve and the end points reuse the baseline signs. The stations lost this way are
-        traced again from their end points; a station that no longer crosses b, or whose crossing
+        Follow the baseline curve c0 on the current design. Each node is bisected in its baseline
+        interval [lo, hi] with the baseline sign, and the projections onto b start from the baseline
+        curve. The nodes whose crossing left that interval are searched again from the same end of
+        their station (see _crossings); a node whose station no longer crosses b, or whose crossing
         moves onto the symmetry plane, does not move.
         Which nodes are exposed is decided on the baseline, so that the curve changes smoothly.
         """
         a, b = c0.a, c0.b
-        u, uB, wB, valid = self._bisect(a, b, c0.w, c0.sLo, (c0.uB, c0.wB))
+        u, uB, wB, d = self._bisect(a, b, c0.w, c0.sLo, (c0.uB, c0.wB), c0.lo, c0.hi)
+        compA = self.allComps[a]
+        size = np.linalg.norm(self._evalSurf(compA, c0.hi, c0.w) - self._evalSurf(compA, c0.lo, c0.w), axis=1)
+        valid = (d < 1e-3 * size) & (d < self.projTol)
         if not valid.all():
             i = np.where(~valid)[0]
-            sLo, cross, guess = self._ends(a, b, c0.w[i])
-            i, sLo, guess = i[cross], sLo[cross], (guess[0][cross], guess[1][cross])
-            u[i], uB[i], wB[i], valid[i] = self._bisect(a, b, c0.w[i], sLo, guess)
+            res = self._crossings(a, b, c0.w[i])
+            for side in (0, 1):
+                found, _, _, _, ui, uBi, wBi = res[side]
+                j = np.where(found & (c0.side[i] == side))[0]
+                u[i[j]], uB[i[j]], wB[i[j]], valid[i[j]] = ui[j], uBi[j], wBi[j], True
         # a crossing that moves onto the symmetry plane is not a junction
-        valid &= ~self._onSym(self._evalSurf(self.allComps[a], u, c0.w))
+        valid &= ~self._onSym(self._evalSurf(compA, u, c0.w))
         u, uB, wB = np.where(valid, u, c0.u), np.where(valid, uB, c0.uB), np.where(valid, wB, c0.wB)
-        X = self._evalSurf(self.allComps[a], u, c0.w)
-        return SimpleNamespace(a=a, b=b, w=c0.w, u=u, uB=uB, wB=wB, sLo=c0.sLo, X=X, valid=valid, exp=c0.exp, dist=c0.dist)
+        X = self._evalSurf(compA, u, c0.w)
+        return SimpleNamespace(**{**vars(c0), "u": u, "uB": uB, "wB": wB, "X": X, "valid": valid})
 
     def _checkCurve(self, c, c0):
         """
@@ -1541,7 +1618,7 @@ class JunctionBlending:
         nLost = np.sum(c0.exp & ~c.valid)
         if nLost > 0:
             print(
-                f"DVGeoVSP warning: {self._name(c)} no longer intersects at {nLost} stations, "
+                f"DVGeoVSP warning: {self._name(c)} no longer intersects at {nLost} nodes, "
                 "the mesh there is not valid; change the geometry or reduce the design change"
             )
         e = c0.exp & c.valid
@@ -1558,25 +1635,54 @@ class JunctionBlending:
         """
         return f"{self.compNames[c.b]}-{self.compNames[c.a]}"
 
-    def _ends(self, a, b, w):
+    def _crossings(self, a, b, w, nSample=50):
         """
-        The signed distance to b at the two ends (u = 0 and u = 1) of the stations w of a. Returns the
-        sign at u = 0, whether the two ends are on opposite sides of b, and the (u, w) on b of the
-        end at u = 1, used to start the bisection.
+        Find, at each station w of a, its crossings of b nearest to its two ends. The station is sampled
+        at nSample points, and the intervals where the signed distance to b changes sign are bisected in
+        turn, from u = 0 for the first crossing and from u = 1 for the last, until a bisection ends on b.
+        The sign also changes off b where the closest point of b jumps, e.g., beyond the closed tip of a
+        fuselage, whose normal is not defined; that bisection ends at a distance from b and is skipped.
+        Returns, for each end (from u = 0, then from u = 1), whether a crossing was found, the sign sLo
+        at the low end of its interval [lo, hi] of u, the crossing u, and its (uB, wB) on b.
         """
-        fLo = self._signedDist(a, b, np.zeros(len(w)), w)[0]
-        fHi, uB, wB, _ = self._signedDist(a, b, np.ones(len(w)), w)
-        return np.sign(fLo), np.sign(fLo) != np.sign(fHi), (uB, wB)
+        nW = len(w)
+        U = np.linspace(0.0, 1.0, nSample)
+        uu, ww = np.tile(U, nW), np.repeat(w, nSample)
+        f, uBs, wBs, _ = self._signedDist(a, b, uu, ww)
+        f, uBs, wBs = f.reshape(nW, nSample), uBs.reshape(nW, nSample), wBs.reshape(nW, nSample)
+        X = self._evalSurf(self.allComps[a], uu, ww).reshape(nW, nSample, 3)
+        size = np.linalg.norm(X[:, 1:] - X[:, :-1], axis=2)
+        res = []
+        for side in (0, 1):
+            cand = np.sign(f[:, :-1]) != np.sign(f[:, 1:])
+            found = np.zeros(nW, dtype=bool)
+            sLo, lo, hi, u, uB, wB = (np.zeros(nW) for _ in range(6))
+            while True:
+                r = np.where(~found & cand.any(axis=1))[0]
+                if len(r) == 0:
+                    break
+                # the candidate interval nearest to this end of the station
+                j = np.argmax(cand[r], axis=1) if side == 0 else nSample - 2 - np.argmax(cand[r, ::-1], axis=1)
+                s = np.sign(f[r, j])
+                ur, uBr, wBr, d = self._bisect(a, b, w[r], s, (uBs[r, j], wBs[r, j]), U[j], U[j + 1])
+                # a bisection that ends on b found a crossing, the others try the next interval
+                ok = (d < 1e-3 * size[r, j]) & (d < self.projTol)
+                k = r[ok]
+                found[k] = True
+                sLo[k], lo[k], hi[k], u[k], uB[k], wB[k] = s[ok], U[j[ok]], U[j[ok] + 1], ur[ok], uBr[ok], wBr[ok]
+                cand[r[~ok], j[~ok]] = False
+            res.append((found, sLo, lo, hi, u, uB, wB))
+        return res
 
-    def _bisect(self, a, b, w, sLo, guess, nIter=20):
+    def _bisect(self, a, b, w, sLo, guess, lo, hi, nIter=20):
         """
-        At each station w of a, bisect along u for the point where the signed distance to b
-        changes sign from sLo, the sign at u = 0. Each projection onto b starts from the previous
-        one, from guess at first. Returns u, the (u, w) of the crossing on b, and whether the
-        crossing lies on b, which fails if the station no longer crosses b.
+        At each station w of a, bisect along u in the interval [lo, hi] for the point where the signed
+        distance to b changes sign from sLo, the sign at lo. Each projection onto b starts from the
+        previous one, from guess at first. Returns u, the (u, w) of the crossing on b, and its distance
+        to b, which is not small if the interval does not contain a crossing of b.
         """
-        lo = np.zeros(len(w))
-        hi = np.ones(len(w))
+        lo = np.array(lo, dtype=float)
+        hi = np.array(hi, dtype=float)
         uB, wB = guess
         for _ in range(nIter):
             mid = 0.5 * (lo + hi)
@@ -1586,7 +1692,7 @@ class JunctionBlending:
             hi = np.where(same, hi, mid)
         u = 0.5 * (lo + hi)
         _, uB, wB, d = self._signedDist(a, b, u, w, (uB, wB))
-        return u, uB, wB, d < self.projTol
+        return u, uB, wB, d
 
     def _signedDist(self, a, b, u, w, guess=None):
         """
@@ -1600,8 +1706,7 @@ class JunctionBlending:
         if guess is None:
             guess = self._gridGuess(compB, X)
         uB, wB, d = self._project(compB, X, guess[0], guess[1])
-        n = self.vspModel.CompVecNorm01(compB, 0, uB.tolist(), wB.tolist())
-        n = np.array([[v.x(), v.y(), v.z()] for v in n]).reshape(-1, 3)
+        n = self._normal(compB, uB, wB)
         return np.sum((X - self._evalSurf(compB, uB, wB)) * n, axis=1), uB, wB, d
 
     def _outside(self, X, skip):
@@ -1619,8 +1724,7 @@ class JunctionBlending:
             if len(m) == 0:
                 continue
             u, w, _ = self._project(comp, X[m], *self._gridGuess(comp, X[m]))
-            n = self.vspModel.CompVecNorm01(comp, 0, u.tolist(), w.tolist())
-            n = np.array([[v.x(), v.y(), v.z()] for v in n]).reshape(-1, 3)
+            n = self._normal(comp, u, w)
             inside[m] = np.sum((X[m] - self._evalSurf(comp, u, w)) * n, axis=1) < 0.0
         return ~inside
 
@@ -1759,6 +1863,13 @@ class JunctionBlending:
         ug, wg = [x.ravel() for x in np.meshgrid(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, n))]
         k = cKDTree(self._evalSurf(comp, ug, wg)).query(X)[1]
         return ug[k], wg[k]
+
+    def _normal(self, comp, u, w):
+        """
+        The unit outward normal of surface 0 of a component at (u, w).
+        """
+        n = self.vspModel.CompVecNorm01(comp, 0, np.asarray(u).tolist(), np.asarray(w).tolist())
+        return np.array([[v.x(), v.y(), v.z()] for v in n]).reshape(-1, 3)
 
     def _evalSurf(self, comp, u, w):
         """
