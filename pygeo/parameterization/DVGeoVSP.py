@@ -87,9 +87,10 @@ class DVGeometryVSP(DVGeoSketch):
 
     symPlane : str or None, optional
        The symmetry plane of a half-model mesh: "x", "y", or "z" for the
-       plane x = 0, y = 0, or z = 0, or None for a full model. The crossings
-       on this plane are not junctions, and the edges of the components on it
-       are stationary lines, so that the points on it only slide along it.
+       plane x = 0, y = 0, or z = 0, or None (default) for a full model. The
+       crossings on this plane are not junctions, and the edges of the
+       components on it are stationary lines, so that the points on it only
+       slide along it. A half-model mesh must set it, e.g., ``symPlane="y"``.
 
     Examples
     --------
@@ -101,7 +102,7 @@ class DVGeometryVSP(DVGeoSketch):
 
     """
 
-    def __init__(self, fileName, comm=MPI.COMM_WORLD, scale=1.0, comps=[], projTol=0.01, name=None, blendComps=None, blendScale=0.3, symPlane="y"):
+    def __init__(self, fileName, comm=MPI.COMM_WORLD, scale=1.0, comps=[], projTol=0.01, name=None, blendComps=None, blendScale=0.3, symPlane=None):
         vspOutOfDate = False
         if vspInstalled:
             vspVersionStr = openvsp.GetVSPVersion()
@@ -1259,8 +1260,9 @@ class JunctionBlending:
         self.modelScale = modelScale
         self.projTol = projTol
         self.comm = comm
-        # whether the surface of each component is closed in w
+        # whether the surface of each component is closed in w, and its range of u without its end caps
         self.closedW = {}
+        self.uRanges = {}
         # the axis normal to the symmetry plane of a half-model mesh; the crossings on that plane are not
         # junctions, since the plane is not a wall, and the points on it are not blended
         self.symAxis = None if symPlane is None else "xyz".index(symPlane)
@@ -1329,6 +1331,9 @@ class JunctionBlending:
         Also find the stationary lines near each blended point: the edges of its component on the
         symmetry plane and its junctions with components that do not move. geom is the component index
         of each point.
+
+        The projection of a blended point starts from the nearest point of a grid on its component and is
+        kept off the end caps of the component (see _uRange).
         """
         # External modules
         from scipy.spatial import cKDTree
@@ -1350,7 +1355,7 @@ class JunctionBlending:
                 wt = 1.0 - 3.0 * s**2 + 2.0 * s**3
                 blend.append((i, g, idx, k, wt))
 
-        # the projection of each blended point starts from the nearest point of a grid on its component
+        # the projection of each blended point starts from the nearest points of a grid on its component
         t1 = time.time()
         surf = []
         Su = np.zeros((len(points), 3))
@@ -1359,9 +1364,31 @@ class JunctionBlending:
         for g in np.unique(geom[allIdx]):
             idx = allIdx[geom[allIdx] == g]
             comp = self.allComps[g]
-            u, w, _ = self._project(comp, points[idx], *self._gridGuess(comp, points[idx]))
+            uRange = self._uRange(comp)
+            u, w, _ = self._project(comp, points[idx], *self._gridGuess(comp, points[idx], uRange=uRange), uRange=uRange)
             surf.append((g, idx, u, w, points[idx] - self._evalSurf(comp, u, w)))
-            Su[idx], Sw[idx] = self._derivs(comp, u, w)
+            Su[idx], Sw[idx] = self._derivs(comp, u, w, uRange=self._uRange(comp))
+
+        # The points of b whose surface coordinates run the opposite way to those of their node, e.g., on the
+        # other side of a thin trailing edge, around which w runs the opposite way; copying the change in the
+        # (u, w) of the node would move them the opposite way, so they take the slide of the node in space.
+        # A direction counts as opposite only if the angle to that of the node exceeds 120 degrees and neither
+        # derivative is degenerate, e.g., zero on a trailing edge where the parameterization stalls, so that
+        # rounding noise does not flip a point.
+        def opposite(p, q):
+            pn, qn = np.linalg.norm(p, axis=1), np.linalg.norm(q, axis=1)
+            ok = (pn > 1e-3 * np.max(pn, initial=0.0)) & (qn > 1e-3 * np.max(qn, initial=0.0))
+            return ok & (np.sum(p * q, axis=1) < -0.5 * pn * qn)
+
+        flip = []
+        for i, g, idx, k, wt in blend:
+            c = self.curves0[i]
+            f = np.zeros(len(idx), dtype=bool)
+            if g == c.b and len(idx):
+                nu, nw = self._derivs(self.allComps[g], c.uB[k], c.wB[k])
+                f = opposite(Su[idx], nu) | opposite(Sw[idx], nw)
+            flip.append(f)
+        blend = [(*b, f) for b, f in zip(blend, flip)]
 
         # The stationary lines of each component: its edge on the symmetry plane, from its points on the
         # plane gathered from all procs, and the exposed nodes of its junctions with components that do not
@@ -1377,7 +1404,7 @@ class JunctionBlending:
         for c in self.fixed:
             lines += [(c.a, c.X[c.exp], c.T[c.exp]), (c.b, c.X[c.exp], c.T[c.exp])]
         fade = np.full(len(points), np.inf)
-        for i, g, idx, k, wt in blend:
+        for i, g, idx, k, wt, f in blend:
             fade[idx] = np.minimum(fade[idx], 0.25 * self.curves0[i].dist)
         fix = []
         for g, X, T in lines:
@@ -1405,7 +1432,9 @@ class JunctionBlending:
         Move the blended points of a point set in the surface coordinates of their own component.
         A point at fixed (u, w) already follows its component, so the shift is the motion of the
         nearest node of the curve in the (u, w) of that component, scaled by the blending weight. A point
-        of another component takes the motion of the node in space, along its own surface.
+        whose (u, w) runs the opposite way to that of its node, e.g., across a thin trailing edge, takes
+        the slide of the node along the component in space instead, and a point of another component
+        takes the motion of the node in space, both along its own surface.
         Where the blending zones of several curves overlap, the weights are normalized to sum to at
         most one. Near a stationary line, only the part of the shift along the line is kept, so that
         the points on the line stay on it. Each point keeps its baseline offset from its component.
@@ -1415,13 +1444,16 @@ class JunctionBlending:
         dU = np.zeros(len(newPts))
         dW = np.zeros(len(newPts))
         wSum = np.zeros(len(newPts))
-        for i, g, idx, k, wt in ps.blend:
+        for i, g, idx, k, wt, flip in ps.blend:
             c0, c = self.curves0[i], self.curves[i]
             if g == c.a:
                 # the stations are fixed, so the points of a only move along u
                 du, dw = (c.u - c0.u)[k], np.zeros(len(k))
             elif g == c.b:
                 du, dw = (c.uB - c0.uB)[k], (self._wrapW(self.allComps[g], c.wB - c0.wB + 0.5) - 0.5)[k]
+                if flip.any():
+                    # the points whose (u, w) runs the opposite way to that of their node take its slide in space
+                    du[flip], dw[flip] = self._toUW(ps.Su[idx[flip]], ps.Sw[idx[flip]], c.slideB[k[flip]])
             else:
                 # the curve has no (u, w) on the other components, so their points take the part of the
                 # motion of the node in space that lies along their surface
@@ -1542,9 +1574,9 @@ class JunctionBlending:
         A curve has the components a and b (indices in allComps) and, at each node, its station index
         k and station w on a, the end of the station it was found from (side: 0 from u = 0, 1 from
         u = 1), the crossing u on a, which is (uB, wB) on b, the interval [lo, hi] of u that contains it
-        and the sign sLo of the distance to b at lo, the point X, whether the crossing was found (valid),
-        whether the node is exposed on the baseline (exp), the blending distance dist, and the number
-        of stations nStation.
+        and the sign sLo of the distance to b at lo, the point X, its slide in space along b since the
+        baseline (slideB, zero on the baseline), whether the crossing was found (valid), whether the node
+        is exposed on the baseline (exp), the blending distance dist, and the number of stations nStation.
         """
         w = np.arange(nStation) / nStation
         (f0, s0, lo0, hi0, u0, uB0, wB0), (f1, s1, lo1, hi1, u1, uB1, wB1) = self._crossings(a, b, w)
@@ -1559,8 +1591,8 @@ class JunctionBlending:
         valid = np.ones(len(k), dtype=bool)
         exp = self._outside(X, (a, b)) & ~self._onSym(X)
         return SimpleNamespace(
-            a=a, b=b, k=k, w=w[k], side=side, u=u, uB=uB, wB=wB, sLo=sLo, lo=lo, hi=hi, X=X, valid=valid, exp=exp,
-            dist=0.0, nStation=nStation,
+            a=a, b=b, k=k, w=w[k], side=side, u=u, uB=uB, wB=wB, sLo=sLo, lo=lo, hi=hi, X=X,
+            slideB=np.zeros_like(X), valid=valid, exp=exp, dist=0.0, nStation=nStation,
         )
 
     def _curveTangent(self, c):
@@ -1607,7 +1639,11 @@ class JunctionBlending:
         valid &= ~self._onSym(self._evalSurf(compA, u, c0.w))
         u, uB, wB = np.where(valid, u, c0.u), np.where(valid, uB, c0.uB), np.where(valid, wB, c0.wB)
         X = self._evalSurf(compA, u, c0.w)
-        return SimpleNamespace(**{**vars(c0), "u": u, "uB": uB, "wB": wB, "X": X, "valid": valid})
+        # the slide of each node along b on the current design
+        compB = self.allComps[b]
+        slideB = self._evalSurf(compB, uB, wB) - self._evalSurf(compB, c0.uB, c0.wB)
+        new = {"u": u, "uB": uB, "wB": wB, "X": X, "slideB": slideB, "valid": valid}
+        return SimpleNamespace(**{**vars(c0), **new})
 
     def _checkCurve(self, c, c0):
         """
@@ -1743,17 +1779,18 @@ class JunctionBlending:
         ba, bb = self.bbox[self.allComps[a]], self.bbox[self.allComps[b]]
         return bool(np.all(ba[:, 0] <= bb[:, 1]) and np.all(bb[:, 0] <= ba[:, 1]))
 
-    def _project(self, comp, X, u, w, nIter=20, nSearch=10):
+    def _project(self, comp, X, u, w, nIter=20, nSearch=10, uRange=(0.0, 1.0)):
         """
         Closest points on surface 0 of a component to the points X (mesh units), starting from (u, w).
         This uses a damped Gauss-Newton method with finite-difference derivatives and a backtracking
-        line search, and keeps u and w in [0, 1]; w wraps around if the surface is closed in w.
+        line search, and keeps u in uRange and w in [0, 1]; w wraps around if the surface is closed in w.
         Only surface evaluations are used, because the OpenVSP projection functions can crash or
         return the guess unchanged for some inputs. Returns u, w and the distance.
         """
         h = 1e-6
+        uLo, uHi = uRange
         closed = self._closedW(comp)
-        u = np.clip(np.array(u, dtype=float), 0.0, 1.0)
+        u = np.clip(np.array(u, dtype=float), uLo, uHi)
         w = self._wrapW(comp, np.array(w, dtype=float))
         S = self._evalSurf(comp, u, w)
         f = np.sum((S - X) ** 2, axis=1)
@@ -1763,7 +1800,7 @@ class JunctionBlending:
                 break
             ua, wa, Sa, Xa = u[act], w[act], S[act], X[act]
             # one-sided finite differences that stay inside the bounds
-            hu = np.where(ua + h > 1.0, -h, h)
+            hu = np.where(ua + h > uHi, -h, h)
             hw = np.where(wa + h > 1.0, -h, h) if not closed else h * np.ones(len(act))
             Su = (self._evalSurf(comp, ua + hu, wa) - Sa) / hu[:, None]
             Sw = (self._evalSurf(comp, ua, self._wrapW(comp, wa + hw)) - Sa) / hw[:, None]
@@ -1783,7 +1820,7 @@ class JunctionBlending:
             done = np.zeros(len(act), dtype=bool)
             for _ in range(nSearch):
                 j = np.where(~done)[0]
-                un = np.clip(ua[j] + alpha[j] * du[j], 0.0, 1.0)
+                un = np.clip(ua[j] + alpha[j] * du[j], uLo, uHi)
                 wn = self._wrapW(comp, wa[j] + alpha[j] * dw[j])
                 Sn = self._evalSurf(comp, un, wn)
                 fn = np.sum((Sn - Xa[j]) ** 2, axis=1)
@@ -1811,19 +1848,41 @@ class JunctionBlending:
             self.closedW[comp] = gap < 1e-8 * max(1.0, size)
         return self.closedW[comp]
 
+    def _uRange(self, comp):
+        """
+        The range of u of surface 0 of a component without its end caps, i.e., the flat faces that close,
+        e.g., a wing at its root and tip. OpenVSP adds each cap as one more section at its end of u, and
+        all sections take the same range of u, so a cap takes 1/n of it for n sections including the caps;
+        a cap on a section that is a point has no size. The blended points are projected off the caps, since
+        across a cap the surface barely moves with u and points the wrong way, so it cannot represent a
+        slide along the surface next to it; their motion is not limited to this range, so a point next to
+        a cap can still move onto it. This does not change with the design, so it is computed once.
+        """
+        if comp not in self.uRanges:
+            vsp = self.vspModel
+            uRange = (0.0, 1.0)
+            if vsp.GetNumXSecSurfs(comp) > 0:
+                cap = {vsp.GetParmName(p): vsp.GetParmVal(p) > 0.5 for p in vsp.GetGeomParmIDs(comp)}
+                lo, hi = int(cap.get("CapUMinOption", False)), int(cap.get("CapUMaxOption", False))
+                n = vsp.GetNumXSec(vsp.GetXSecSurf(comp, 0)) - 1 + lo + hi
+                if n > lo + hi:
+                    uRange = (lo / n, 1.0 - hi / n)
+            self.uRanges[comp] = uRange
+        return self.uRanges[comp]
+
     def _wrapW(self, comp, w):
         """
         Wrap w into [0, 1) if the surface of the component is closed in w, otherwise clip it to [0, 1].
         """
         return np.mod(w, 1.0) if self._closedW(comp) else np.clip(w, 0.0, 1.0)
 
-    def _derivs(self, comp, u, w, h=1e-6):
+    def _derivs(self, comp, u, w, h=1e-6, uRange=(0.0, 1.0)):
         """
         The derivatives of surface 0 of a component with respect to u and w at (u, w), by one-sided
-        finite differences that stay inside the bounds.
+        finite differences that stay inside the bounds, u in uRange.
         """
         S = self._evalSurf(comp, u, w)
-        hu = np.where(u + h > 1.0, -h, h)
+        hu = np.where(u + h > uRange[1], -h, h)
         hw = h * np.ones(len(w)) if self._closedW(comp) else np.where(w + h > 1.0, -h, h)
         Su = (self._evalSurf(comp, u + hu, w) - S) / hu[:, None]
         Sw = (self._evalSurf(comp, u, self._wrapW(comp, w + hw)) - S) / hw[:, None]
@@ -1832,12 +1891,15 @@ class JunctionBlending:
     def _toUW(self, Su, Sw, d):
         """
         The change in the surface coordinates (u, w) whose shift Su du + Sw dw is closest to the shift d of
-        each point, from the normal equations of the surface derivatives.
+        each point, from the normal equations of the surface derivatives. A small damping, relative to the
+        derivatives, keeps the change along a degenerate direction, e.g., where a derivative is zero on a
+        trailing edge, near zero instead of letting it grow without bound.
         """
         a, b, c = np.sum(Su * Su, axis=1), np.sum(Su * Sw, axis=1), np.sum(Sw * Sw, axis=1)
         ru, rw = np.sum(Su * d, axis=1), np.sum(Sw * d, axis=1)
-        det = a * c - b * b + 1e-12 * (a + c) ** 2 + 1e-300
-        return (c * ru - b * rw) / det, (a * rw - b * ru) / det
+        lam = 1e-6 * (a + c) + 1e-300
+        det = (a + lam) * (c + lam) - b * b
+        return ((c + lam) * ru - b * rw) / det, ((a + lam) * rw - b * ru) / det
 
     def _tangent(self, X, k=6):
         """
@@ -1852,15 +1914,15 @@ class JunctionBlending:
         N = N - N.mean(axis=1, keepdims=True)
         return np.linalg.eigh(np.einsum("nki,nkj->nij", N, N))[1][:, :, -1]
 
-    def _gridGuess(self, comp, X, n=101):
+    def _gridGuess(self, comp, X, n=101, uRange=(0.0, 1.0)):
         """
-        Surface (u, w) of the nearest point of a uniform n x n grid on surface 0 of a component,
-        used to start the projection of points without a guess.
+        Surface (u, w) of the nearest point of a uniform n x n grid on surface 0 of a component, u in
+        uRange, used to start the projection of points without a guess.
         """
         # External modules
         from scipy.spatial import cKDTree
 
-        ug, wg = [x.ravel() for x in np.meshgrid(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, n))]
+        ug, wg = [x.ravel() for x in np.meshgrid(np.linspace(*uRange, n), np.linspace(0.0, 1.0, n))]
         k = cKDTree(self._evalSurf(comp, ug, wg)).query(X)[1]
         return ug[k], wg[k]
 
